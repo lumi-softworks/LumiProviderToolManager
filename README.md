@@ -1,4 +1,4 @@
-# ProviderToolManager
+# LumiProviderToolManager
 
 📖 English | [中文版](README_zh.md)
 
@@ -6,7 +6,7 @@ Agent tool registration and execution provider. Hosts register `SuperAgentTool` 
 
 ## Package
 
-- Manifest package name: `ProviderToolManager` (matches the repository name)
+- Manifest package name: `LumiProviderToolManager` (matches the repository name)
 - Product / Target: `ProviderToolManager`
 - Platform: macOS 14+, iOS 17+
 - Swift tools: 6.0
@@ -22,13 +22,13 @@ Agent tool registration and execution provider. Hosts register `SuperAgentTool` 
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/lumi-softworks/ProviderToolManager.git", from: "1.0.0"),
+    .package(url: "https://github.com/lumi-softworks/LumiProviderToolManager.git", from: "1.0.0"),
 ],
 targets: [
     .target(
         name: "YourTarget",
         dependencies: [
-            .product(name: "ProviderToolManager", package: "ProviderToolManager"),
+            .product(name: "ProviderToolManager", package: "LumiProviderToolManager"),
         ],
     ),
 ]

@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "ProviderToolManager",
+    name: "LumiProviderToolManager",
     defaultLocalization: "en",
     platforms: [
         .macOS("14.0"),
