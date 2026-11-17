@@ -74,9 +74,15 @@ public actor ToolCallRecordStore {
     }
 
     /// 停止定时刷新任务（生命周期结束时调用）。
+    ///
+    /// 停止前同步冲刷缓冲区：最近完成的调用可能还留在缓冲里（不足一批
+    /// 不触发按量 flush），退出时若不落库，重启后会永久丢失（#1163）。
+    /// 本方法运行在 store actor 上，晚于它入队的 record() 不存在，早于它
+    /// 的都已按 FIFO 顺序先行处理，这次冲刷覆盖全部已接受的记录。
     public func stopFlushTask() {
         flushTask?.cancel()
         flushTask = nil
+        flush()
     }
 
     // MARK: - Public API

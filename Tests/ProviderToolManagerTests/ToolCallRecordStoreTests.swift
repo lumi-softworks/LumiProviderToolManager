@@ -166,6 +166,68 @@ struct ToolCallRecordStoreTests {
         #expect(await store.count() == 5)
     }
 
+    /// 退出冲刷（#1163）：不足一批的记录只存在缓冲里，stopFlushTask 若只
+    /// 取消定时器不落库，最近完成的调用会在退出后永久丢失。用独立的新
+    /// 容器检查磁盘内容——读取路径自带的 flush 会掩盖缓冲，第二个实例
+    /// 只能看到已真正落库的记录。
+    @Test("stopFlushTask 必须把缓冲中的记录落盘（#1163）")
+    func stopFlushTaskFlushesPendingRecords() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let conversationID = UUID()
+        for index in 0..<3 {
+            await store.record(
+                toolCallID: "call-\(index)",
+                toolName: "tool",
+                toolDisplayName: "tool",
+                turnID: nil,
+                conversationID: conversationID,
+                createdAt: Date(),
+                startedAt: Date(),
+                completedAt: nil,
+                duration: nil,
+                argumentsJSON: "{}",
+                resultContent: "r\(index)",
+                resultIsError: false,
+                riskLevel: "safe"
+            )
+        }
+        // 注意：不能在 stopFlushTask 之前做任何读取——count / fetch 全部
+        // 自带 flush，会把缓冲提前落库，测试就测不到退出冲刷了。
+        await store.stopFlushTask()
+
+        let reopened = ToolCallRecordStore(databaseRootURL: dir)
+        #expect(await reopened.count() == 3)
+    }
+
+    @Test("stopFlushTask 后缓冲清空，重复停止无副作用")
+    func stopFlushTaskIsIdempotent() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let conversationID = UUID()
+        await store.record(
+            toolCallID: "call-idem",
+            toolName: "tool",
+            toolDisplayName: "tool",
+            turnID: nil,
+            conversationID: conversationID,
+            createdAt: Date(),
+            startedAt: Date(),
+            completedAt: nil,
+            duration: nil,
+            argumentsJSON: "{}",
+            resultContent: "r",
+            resultIsError: false,
+            riskLevel: "safe"
+        )
+
+        await store.stopFlushTask()
+        await store.stopFlushTask()
+        #expect(await store.count() == 1)
+    }
+
     @Test("上下文不可用时所有接口安全降级且不崩溃")
     func unavailableContextDegradesToNoOp() async throws {
         let directory = FileManager.default.temporaryDirectory
