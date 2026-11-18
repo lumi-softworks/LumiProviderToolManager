@@ -16,12 +16,14 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/lumi-softworks/LumiKitAgentTool.git", from: "1.0.0"),
+        .package(url: "https://github.com/lumi-softworks/LumiLogging.git", from: "1.0.2"),
     ],
     targets: [
         .target(
             name: "ProviderToolManager",
             dependencies: [
                 .product(name: "KitAgentTool", package: "LumiKitAgentTool"),
+                .product(name: "LumiLoggingKit", package: "LumiLogging"),
             ],
             path: "Sources/ProviderToolManager"
         ),
