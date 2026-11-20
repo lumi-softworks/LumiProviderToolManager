@@ -1,5 +1,6 @@
 import KitAgentTool
 import Foundation
+import os
 import Testing
 @testable import ProviderToolManager
 
@@ -20,6 +21,29 @@ private struct ContextConversationTool: SuperAgentTool {
         arguments: [String: ToolArgument]
     ) async throws -> ToolCallResult {
         ToolCallResult(content: context.conversationID.uuidString)
+    }
+}
+
+/// 统计执行次数的工具：每次执行返回递增序号，用于断言是否真实执行。
+private final class CountingConversationTool: SuperAgentTool {
+    let name = "counting_conversation"
+    private let executionCount = OSAllocatedUnfairLock(initialState: 0)
+
+    var count: Int { executionCount.withLock { $0 } }
+
+    func description(for language: LanguagePreference) -> String { name }
+    func inputSchema(for language: LanguagePreference) -> [String: Any] { [:] }
+    func permissionRiskLevel(arguments: [String: ToolArgument]) -> CommandRiskLevel { .high }
+    func displayDescription(for arguments: [String: ToolArgument]) -> String { name }
+
+    func execute(arguments: [String: ToolArgument]) async throws -> String { "" }
+
+    func executeResult(
+        context: ToolExecutionContext,
+        arguments: [String: ToolArgument]
+    ) async throws -> ToolCallResult {
+        let value = executionCount.withLock { $0 += 1; return $0 }
+        return ToolCallResult(content: "exec-\(value)")
     }
 }
 
@@ -243,5 +267,134 @@ struct DefaultToolManagerProvidingTests {
     func toolCallResultNil() async {
         let manager = DefaultToolManagerProviding()
         #expect(await manager.toolCallResult(for: "nope") == nil)
+    }
+
+    // MARK: - 授权结果作用域（#177）
+
+    @Test("不同会话复用同一 toolCallID 时不得串用授权结果（#177）")
+    func authorizedResultNotReusedAcrossConversations() async {
+        let manager = DefaultToolManagerProviding()
+        let tool = CountingConversationTool()
+        manager.add(tool, pluginID: "p")
+
+        let conversationA = UUID()
+        let resultA = await manager.executeAuthorized(
+            makeToolCall(name: "counting_conversation", id: "call_0"),
+            conversationID: conversationA,
+            turnID: UUID()
+        )
+        #expect(resultA.content == "exec-1")
+        #expect(tool.count == 1)
+
+        // 会话 B 使用相同 toolCallID：必须真实执行，而不是拿到 A 的结果。
+        let resultB = await manager.executeAuthorized(
+            makeToolCall(name: "counting_conversation", id: "call_0"),
+            conversationID: UUID(),
+            turnID: UUID()
+        )
+        #expect(resultB.content == "exec-2")
+        #expect(tool.count == 2, "会话 B 必须重新执行，实际执行次数 \(tool.count)")
+    }
+
+    @Test("同会话不同回合复用同一 toolCallID 时按回合隔离（#177）")
+    func authorizedResultIsolatedPerTurn() async {
+        let manager = DefaultToolManagerProviding()
+        let tool = CountingConversationTool()
+        manager.add(tool, pluginID: "p")
+        let conversationID = UUID()
+
+        _ = await manager.executeAuthorized(
+            makeToolCall(name: "counting_conversation", id: "call_0"),
+            conversationID: conversationID,
+            turnID: UUID()
+        )
+        #expect(tool.count == 1)
+
+        // 新回合携带新 turnID：不能复用上一回合的结果。
+        let result = await manager.executeAuthorized(
+            makeToolCall(name: "counting_conversation", id: "call_0"),
+            conversationID: conversationID,
+            turnID: UUID()
+        )
+        #expect(result.content == "exec-2")
+        #expect(tool.count == 2)
+    }
+
+    @Test("持久化记录按会话/回合作用域查询，跨作用域不串结果（#177）")
+    func persistedRecordIsolatedAcrossScopes() async throws {
+        let (store, dir) = try makeRecordStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manager = DefaultToolManagerProviding()
+        manager.recordStore = store
+
+        let conversationA = UUID()
+        let turnID = UUID()
+        await store.record(
+            toolCallID: "call_0",
+            toolName: "counting_conversation",
+            toolDisplayName: "counting_conversation",
+            turnID: turnID,
+            conversationID: conversationA,
+            createdAt: Date(),
+            startedAt: Date(),
+            completedAt: Date(),
+            duration: 0.1,
+            argumentsJSON: "{}",
+            resultContent: "A-result",
+            resultIsError: false,
+            riskLevel: "high"
+        )
+
+        // 会话 B（无 turnID）查询同一 ID：不能拿到 A 的记录。
+        #expect(await manager.toolCallResult(for: "call_0", conversationID: UUID(), turnID: nil) == nil)
+        // 会话 B 携带 A 的 turnID：按会话过滤后仍不命中。
+        #expect(await manager.toolCallResult(for: "call_0", conversationID: UUID(), turnID: turnID) == nil)
+        // 同会话不同回合：turnID 可用时必须按回合隔离。
+        #expect(await manager.toolCallResult(for: "call_0", conversationID: conversationA, turnID: UUID()) == nil)
+        // 会话 A 同回合查询命中。
+        let scopedA = await manager.toolCallResult(for: "call_0", conversationID: conversationA, turnID: turnID)
+        #expect(scopedA?.content == "A-result")
+    }
+
+    @Test("重启后同会话同回合的授权结果仍复用持久化记录（#177）")
+    func persistedResultReusedWithinScope() async throws {
+        let (store, dir) = try makeRecordStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let conversationID = UUID()
+        let turnID = UUID()
+
+        let first = DefaultToolManagerProviding()
+        first.recordStore = store
+        let firstTool = CountingConversationTool()
+        first.add(firstTool, pluginID: "p")
+        let firstResult = await first.executeAuthorized(
+            makeToolCall(name: "counting_conversation", id: "call_0"),
+            conversationID: conversationID,
+            turnID: turnID
+        )
+        #expect(firstResult.content == "exec-1")
+        await store.stopFlushTask()
+
+        // 新进程：内存缓存为空，只能依赖持久化记录复用。
+        let second = DefaultToolManagerProviding()
+        second.recordStore = store
+        let secondTool = CountingConversationTool()
+        second.add(secondTool, pluginID: "p")
+        let reused = await second.executeAuthorized(
+            makeToolCall(name: "counting_conversation", id: "call_0"),
+            conversationID: conversationID,
+            turnID: turnID
+        )
+        #expect(reused.content == "exec-1")
+        #expect(secondTool.count == 0, "重启后不应重新执行，实际执行 \(secondTool.count) 次")
+        await store.stopFlushTask()
+    }
+
+    /// 每个测试使用独立临时目录，避免跨测试数据库冲突。
+    private func makeRecordStore() throws -> (ToolCallRecordStore, URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AuthorizedScopeTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return (ToolCallRecordStore(databaseRootURL: dir), dir)
     }
 }

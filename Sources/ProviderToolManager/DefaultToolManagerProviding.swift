@@ -34,8 +34,13 @@ public final class DefaultToolManagerProviding: ToolManagerProviding, SuperLog {
 
     /// 当前进程内产生的结果 fast path：持久化是异步的，
     /// UI 需要能立即解析刚完成的调用结果。
+    /// 键为 `conversationID|turnID|toolCallID` 复合键：模型供应商常在不同
+    /// 会话 / 回合复用同一 `toolCallID`，裸 ID 缓存会把上一会话的结果
+    /// 串给下一会话（#177）。
     private var resultCache: [String: ToolCallResult] = [:]
     private var resultCacheConversationIDs: [String: UUID] = [:]
+    /// 裸 `toolCallID` → 最新复合缓存键，供无作用域查询沿用 fast path。
+    private var latestResultCacheKeys: [String: String] = [:]
     private var deletedConversationIDs: Set<UUID> = []
     private var toolManagerObservers: [UUID: (ToolManagerEvent) -> Void] = [:]
 
@@ -163,12 +168,12 @@ public final class DefaultToolManagerProviding: ToolManagerProviding, SuperLog {
 
         guard !deletedConversationIDs.contains(conversationID) else {
             let result = ToolCallResult(content: "Conversation was deleted", isError: true)
-            cache(result, for: toolCall.id, conversationID: conversationID)
+            cache(result, for: toolCall.id, conversationID: conversationID, turnID: turnID)
             return finish(result)
         }
         guard let tool = registeredTools[toolCall.name] else {
             let result = ToolCallResult(content: "Tool not found: \(toolCall.name)", isError: true)
-            cache(result, for: toolCall.id, conversationID: conversationID)
+            cache(result, for: toolCall.id, conversationID: conversationID, turnID: turnID)
             return finish(result)
         }
 
@@ -185,7 +190,7 @@ public final class DefaultToolManagerProviding: ToolManagerProviding, SuperLog {
                 isError: true,
                 duration: Date().timeIntervalSince(startedAt)
             )
-            cache(result, for: toolCall.id, conversationID: conversationID)
+            cache(result, for: toolCall.id, conversationID: conversationID, turnID: turnID)
             logToolCall(
                 toolCallID: toolCall.id,
                 toolName: tool.name,
@@ -236,7 +241,7 @@ public final class DefaultToolManagerProviding: ToolManagerProviding, SuperLog {
                 isError: true,
                 duration: Date().timeIntervalSince(startedAt)
             )
-            cache(result, for: toolCall.id, conversationID: conversationID)
+            cache(result, for: toolCall.id, conversationID: conversationID, turnID: turnID)
             logToolCall(
                 toolCallID: toolCall.id,
                 toolName: tool.name,
@@ -265,7 +270,7 @@ public final class DefaultToolManagerProviding: ToolManagerProviding, SuperLog {
             awaitingUserResponse: awaitingUserResponse,
             interactionState: interactionState
         )
-        cache(result, for: toolCall.id, conversationID: conversationID)
+        cache(result, for: toolCall.id, conversationID: conversationID, turnID: turnID)
 
         // 记录成功的调用（后台异步，不阻塞主流程）
         logToolCall(
@@ -296,8 +301,13 @@ public final class DefaultToolManagerProviding: ToolManagerProviding, SuperLog {
         var authorizedToolCall = toolCall
         authorizedToolCall.authorizationState = .userApproved
         // 历史授权可能在上一个进程中已经完成执行，但结果事件尚未来得及
-        // 回写消息。优先复用记录，避免重启后重复执行有副作用的工具。
-        if let existingResult = await toolCallResult(for: toolCall.id) {
+        // 回写消息。优先复用同一会话/回合内的记录，避免重启后重复执行有
+        // 副作用的工具；跨会话/回合复用同一 toolCallID 不在此列（#177）。
+        if let existingResult = await toolCallResult(
+            for: toolCall.id,
+            conversationID: conversationID,
+            turnID: turnID
+        ) {
             notify(.authorizedCompleted(
                 conversationID: conversationID,
                 turnID: turnID,
@@ -391,50 +401,100 @@ public final class DefaultToolManagerProviding: ToolManagerProviding, SuperLog {
         return await recordStore.fetchRecords(forTurnIDs: turnIDs)
     }
 
-    /// 按原始 `ToolCall.id` 查询一次调用的结果。
+    /// 按原始 `ToolCall.id` 查询一次调用的结果（无作用域，取最新一次）。
     public func toolCallResult(for toolCallID: String) async -> ToolCallResult? {
-        if let cached = resultCache[toolCallID] {
+        if let cacheKey = latestResultCacheKeys[toolCallID],
+           let cached = resultCache[cacheKey] {
             return cached
         }
         guard let record = await recordStore?.fetchRecord(forToolCallID: toolCallID) else {
             return nil
         }
+        return Self.result(from: record)
+    }
 
-        if let resultJSON = record.resultJSON,
-           let data = resultJSON.data(using: .utf8),
-           let result = try? JSONDecoder().decode(ToolCallResult.self, from: data) {
-            return result
+    /// 在指定会话/回合作用域内按原始 `ToolCall.id` 查询结果。
+    ///
+    /// 内存缓存按复合键命中；持久化回退在有 `turnID` 时按回合取记录，
+    /// 否则按会话取记录，再按会话 + 原始 ID 过滤。不同会话/回合复用
+    /// 同一 `toolCallID` 时不会串用彼此的结果（#177）。
+    public func toolCallResult(
+        for toolCallID: String,
+        conversationID: UUID,
+        turnID: UUID?
+    ) async -> ToolCallResult? {
+        let cacheKey = Self.resultCacheKey(
+            toolCallID: toolCallID,
+            conversationID: conversationID,
+            turnID: turnID
+        )
+        if let cached = resultCache[cacheKey] {
+            return cached
         }
 
-        // 兼容未写入完整结果快照的早期记录：仍可提供文本结果。
-        return ToolCallResult(
-            content: record.resultContent,
-            isError: record.resultIsError,
-            duration: record.duration
-        )
+        let records: [ToolCallRecord]
+        if let turnID {
+            records = await recordStore?.fetchRecords(forTurnID: turnID) ?? []
+        } else {
+            records = await recordStore?.fetchRecords(for: conversationID) ?? []
+        }
+        guard let record = records.first(where: {
+            $0.conversationID == conversationID && $0.toolCallID == toolCallID
+        }) else {
+            return nil
+        }
+        return Self.result(from: record)
     }
 
     public func deleteToolCalls(for conversationID: UUID) async {
         deletedConversationIDs.insert(conversationID)
         // 清理瞬时结果与持久化执行日志。
-        if let records = await recordStore?.fetchRecords(for: conversationID) {
-            for record in records {
-                if let toolCallID = record.toolCallID {
-                    resultCache.removeValue(forKey: toolCallID)
-                }
-            }
-        }
         resultCacheConversationIDs = resultCacheConversationIDs.filter { $0.value != conversationID }
         resultCache = resultCache.filter { resultCacheConversationIDs[$0.key] != nil }
+        latestResultCacheKeys = latestResultCacheKeys.filter { resultCache[$0.value] != nil }
         await recordStore?.deleteAll(for: conversationID)
     }
 
     // MARK: - Result Cache
 
-    private func cache(_ result: ToolCallResult, for toolCallID: String, conversationID: UUID) {
+    private func cache(
+        _ result: ToolCallResult,
+        for toolCallID: String,
+        conversationID: UUID,
+        turnID: UUID?
+    ) {
         guard !deletedConversationIDs.contains(conversationID) else { return }
-        resultCache[toolCallID] = result
-        resultCacheConversationIDs[toolCallID] = conversationID
+        let key = Self.resultCacheKey(
+            toolCallID: toolCallID,
+            conversationID: conversationID,
+            turnID: turnID
+        )
+        resultCache[key] = result
+        resultCacheConversationIDs[key] = conversationID
+        latestResultCacheKeys[toolCallID] = key
+    }
+
+    /// 结果缓存复合键：会话 + 回合 + 原始 `toolCall.id`。
+    private static func resultCacheKey(
+        toolCallID: String,
+        conversationID: UUID,
+        turnID: UUID?
+    ) -> String {
+        conversationID.uuidString + "|" + (turnID?.uuidString ?? "nil") + "|" + toolCallID
+    }
+
+    /// 把持久化记录还原为结果；兼容未写入完整结果快照的早期记录。
+    private static func result(from record: ToolCallRecord) -> ToolCallResult {
+        if let resultJSON = record.resultJSON,
+           let data = resultJSON.data(using: .utf8),
+           let result = try? JSONDecoder().decode(ToolCallResult.self, from: data) {
+            return result
+        }
+        return ToolCallResult(
+            content: record.resultContent,
+            isError: record.resultIsError,
+            duration: record.duration
+        )
     }
 
     // MARK: - Tool Call Logging
