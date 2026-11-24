@@ -114,6 +114,10 @@ struct ToolJobRecordStoreTests {
         // 截断不等于删除会话：同一会话仍可写入新回合。
         await store.upsert(makeRecord(id: "job-new", conversationID: conversationID, turnID: UUID()))
         #expect(await store.fetchRecord(forJobID: "job-new") != nil)
+
+        // 被截断回合的 Job 若还在收尾，迟到的终态落库必须丢弃。
+        await store.upsert(makeRecord(id: "job-late", conversationID: conversationID, turnID: removedTurn))
+        #expect(await store.fetchRecord(forJobID: "job-late") == nil)
     }
 
     @Test("超过 Int32.max 的输出字节数在启动恢复后保持完整")
