@@ -140,6 +140,90 @@ struct ToolCallRecordStoreTests {
         #expect(await store.count() == 0)
     }
 
+    @Test("deleteRecords(forTurnIDs:) 只删除指定回合，会话仍可写入")
+    func deleteRecordsForTurns() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let conversationID = UUID()
+        let removedTurn = UUID()
+        let keptTurn = UUID()
+        let sameTurnOtherConversation = UUID()
+        for (index, turnID) in [removedTurn, keptTurn, removedTurn, nil].enumerated() {
+            await store.record(
+                toolCallID: "call-\(index)",
+                toolName: "tool",
+                toolDisplayName: "tool",
+                turnID: turnID,
+                conversationID: index == 2 ? sameTurnOtherConversation : conversationID,
+                createdAt: Date(),
+                startedAt: Date(),
+                completedAt: Date(),
+                duration: nil,
+                argumentsJSON: "{}",
+                resultContent: "r\(index)",
+                resultIsError: false,
+                riskLevel: "safe"
+            )
+        }
+        #expect(await store.count() == 4)
+
+        await store.deleteRecords(forTurnIDs: [removedTurn])
+
+        #expect(await store.fetchRecords(forTurnID: removedTurn).isEmpty)
+        #expect(await store.fetchRecords(forTurnID: keptTurn).count == 1)
+        // 没有 turnID 的记录不属于任何回合，不能被顺带删掉。
+        #expect(await store.fetchRecords(for: conversationID).count == 2)
+        #expect(await store.count() == 2)
+
+        // 截断不等于删除会话：同一会话的新回合仍要落库。
+        await store.record(
+            toolCallID: "call-new",
+            toolName: "tool",
+            toolDisplayName: "tool",
+            turnID: UUID(),
+            conversationID: conversationID,
+            createdAt: Date(),
+            startedAt: Date(),
+            completedAt: nil,
+            duration: nil,
+            argumentsJSON: "{}",
+            resultContent: "new",
+            resultIsError: false,
+            riskLevel: "safe"
+        )
+        #expect(await store.count() == 3)
+    }
+
+    @Test("deleteRecords(forTurnIDs:) 先冲刷缓冲区，不足一批的记录也会被删除")
+    func deleteRecordsForTurnsFlushesBufferedRecords() async throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let conversationID = UUID()
+        let turnID = UUID()
+        await store.record(
+            toolCallID: "call-buffered",
+            toolName: "tool",
+            toolDisplayName: "tool",
+            turnID: turnID,
+            conversationID: conversationID,
+            createdAt: Date(),
+            startedAt: Date(),
+            completedAt: nil,
+            duration: nil,
+            argumentsJSON: "{}",
+            resultContent: "buffered",
+            resultIsError: false,
+            riskLevel: "safe"
+        )
+
+        await store.deleteRecords(forTurnIDs: [turnID])
+        await store.flush()
+
+        #expect(await store.count() == 0)
+    }
+
     @Test("count 反映持久化记录数")
     func count() async throws {
         let (store, dir) = try makeStore()

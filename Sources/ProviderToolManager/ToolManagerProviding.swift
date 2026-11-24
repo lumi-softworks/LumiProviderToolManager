@@ -162,6 +162,17 @@ public protocol ToolManagerProviding: AnyObject {
     ///
     /// 会话删除时调用，保证工具结果不会比引用它的会话时间线更长寿。
     func deleteToolCalls(for conversationID: UUID) async
+
+    /// 删除某几个回合的工具调用记录（编辑并重发时截断时间线）。
+    ///
+    /// 只清理这些回合的 Job、结果缓存与持久化记录；会话的其它回合、
+    /// 后台任务和会话的写入资格都不受影响。
+    func deleteToolCalls(forTurnIDs turnIDs: [UUID], in conversationID: UUID) async
+}
+
+public extension ToolManagerProviding {
+    /// 默认无操作，保持旧版测试桩和第三方实现兼容。
+    func deleteToolCalls(forTurnIDs turnIDs: [UUID], in conversationID: UUID) async {}
 }
 
 // MARK: - Default registration

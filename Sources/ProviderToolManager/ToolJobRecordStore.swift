@@ -17,6 +17,8 @@ public actor ToolJobRecordStore {
     /// `nil` 表示持久化与内存容器都创建失败——此时服务安全降级为 no-op。
     private let modelContext: ModelContext?
     private var deletedConversationIDs: Set<String> = []
+    /// 已被截断的回合。回合 ID 全局唯一且不会复用，迟到的 Job 终态落库直接丢弃。
+    private var deletedTurnIDs: Set<String> = []
     nonisolated public let directory: URL
     /// 消息库文件路径——启动恢复的原生 SQL 快路径直接读它。
     private nonisolated let databaseURL: URL
@@ -50,6 +52,13 @@ public actor ToolJobRecordStore {
         modelContext?.autosaveEnabled = false
         self.modelContext = modelContext
         Self.ensureStartupLookupIndex(at: storeURL)
+        ToolRecordIndex.ensure(
+            name: "ZTOOLJOB_TURN",
+            table: "ZTOOLJOBRECORDMODEL",
+            // 带 ZCREATEDAT：按 turn 过滤后按时间排序也不需要临时排序。
+            columns: ["ZTURNID", "ZCREATEDAT"],
+            databaseURL: storeURL
+        )
     }
 
     /// 测试用：直接注入上下文；`nil` 表示存储不可用。
@@ -107,7 +116,8 @@ public actor ToolJobRecordStore {
 
     /// 创建或更新一条 Job 快照。按 Job ID 幂等写入。
     public func upsert(_ record: ToolJobRecord) {
-        guard !deletedConversationIDs.contains(record.conversationID.uuidString) else { return }
+        guard !deletedConversationIDs.contains(record.conversationID.uuidString),
+              !(record.turnID.map { deletedTurnIDs.contains($0.uuidString) } ?? false) else { return }
         guard let modelContext else { return }
         let descriptor = FetchDescriptor<ToolJobRecordModel>(
             predicate: #Predicate<ToolJobRecordModel> { $0.id == record.id }
@@ -355,6 +365,23 @@ public actor ToolJobRecordStore {
         deletedConversationIDs.insert(conversationIDString)
         let descriptor = FetchDescriptor<ToolJobRecordModel>(
             predicate: #Predicate<ToolJobRecordModel> { $0.conversationID == conversationIDString }
+        )
+        guard let models = try? modelContext.fetch(descriptor) else { return }
+        for model in models {
+            modelContext.delete(model)
+        }
+        try? modelContext.save()
+    }
+
+    /// 删除指定回合的 Job 记录；同一会话的其它回合不受影响，会话仍可写入。
+    public func deleteJobs(forTurnIDs turnIDs: [UUID]) {
+        guard !turnIDs.isEmpty, let modelContext else { return }
+        let turnIDStrings = turnIDs.map(\.uuidString)
+        deletedTurnIDs.formUnion(turnIDStrings)
+        let descriptor = FetchDescriptor<ToolJobRecordModel>(
+            predicate: #Predicate<ToolJobRecordModel> { model in
+                model.turnID != nil && turnIDStrings.contains(model.turnID!)
+            }
         )
         guard let models = try? modelContext.fetch(descriptor) else { return }
         for model in models {
