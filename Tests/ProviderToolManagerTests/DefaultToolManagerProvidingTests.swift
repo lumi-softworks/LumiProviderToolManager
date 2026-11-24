@@ -390,6 +390,39 @@ struct DefaultToolManagerProvidingTests {
         await store.stopFlushTask()
     }
 
+    @Test("按回合删除工具记录：只清掉指定回合的缓存与持久化记录，会话仍可执行")
+    func deleteToolCallsForTurns() async throws {
+        let (store, dir) = try makeRecordStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manager = DefaultToolManagerProviding()
+        manager.recordStore = store
+        manager.add(MockTool(name: "read"), pluginID: "p")
+        let conversationID = UUID()
+        let otherConversationID = UUID()
+        let removedTurn = UUID()
+        let keptTurn = UUID()
+
+        _ = await manager.execute(makeToolCall(name: "read", id: "call_removed"), conversationID: conversationID, turnID: removedTurn)
+        _ = await manager.execute(makeToolCall(name: "read", id: "call_kept"), conversationID: conversationID, turnID: keptTurn)
+        _ = await manager.execute(makeToolCall(name: "read", id: "call_no_turn"), conversationID: conversationID, turnID: nil)
+        _ = await manager.execute(makeToolCall(name: "read", id: "call_other"), conversationID: otherConversationID, turnID: removedTurn)
+
+        await manager.deleteToolCalls(forTurnIDs: [removedTurn], in: conversationID)
+
+        #expect(await manager.toolCallResult(for: "call_removed", conversationID: conversationID, turnID: removedTurn) == nil)
+        // turnID 全局唯一；别的会话恰好用了同一个 turnID 的记录不在清理范围内。
+        #expect(await manager.toolCalls(for: removedTurn).map(\.conversationID) == [otherConversationID])
+        #expect(await manager.toolCallResult(for: "call_kept", conversationID: conversationID, turnID: keptTurn) != nil)
+        #expect(await manager.toolCallResult(for: "call_no_turn", conversationID: conversationID, turnID: nil) != nil)
+        #expect(await manager.toolCallResult(for: "call_other", conversationID: otherConversationID, turnID: removedTurn) != nil)
+
+        // 截断后同一会话仍可执行工具并缓存结果。
+        let newTurn = UUID()
+        let again = await manager.execute(makeToolCall(name: "read", id: "call_new"), conversationID: conversationID, turnID: newTurn)
+        #expect(!again.isError)
+        #expect(await manager.toolCallResult(for: "call_new", conversationID: conversationID, turnID: newTurn) != nil)
+    }
+
     /// 每个测试使用独立临时目录，避免跨测试数据库冲突。
     private func makeRecordStore() throws -> (ToolCallRecordStore, URL) {
         let dir = FileManager.default.temporaryDirectory

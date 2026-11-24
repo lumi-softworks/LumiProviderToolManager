@@ -455,6 +455,28 @@ public final class DefaultToolManagerProviding: ToolManagerProviding, SuperLog {
         await recordStore?.deleteAll(for: conversationID)
     }
 
+    public func deleteToolCalls(forTurnIDs turnIDs: [UUID], in conversationID: UUID) async {
+        guard !turnIDs.isEmpty else { return }
+        let turnIDStrings = Set(turnIDs.map(\.uuidString))
+        for turnID in turnIDs {
+            cancelJobs(forTurnID: turnID)
+        }
+        await recordStore?.deleteRecords(forTurnIDs: turnIDs)
+        let prefix = conversationID.uuidString + "|"
+        // key 形如 conversation|turn|toolCallID；没有 turn 的记录不属于任何回合。
+        let removedKeys = resultCacheConversationIDs.keys.filter { key in
+            guard key.hasPrefix(prefix), resultCacheConversationIDs[key] == conversationID else { return false }
+            let turn = key.dropFirst(prefix.count).prefix(while: { $0 != "|" })
+            return turnIDStrings.contains(String(turn))
+        }
+        guard !removedKeys.isEmpty else { return }
+        for key in removedKeys {
+            resultCache.removeValue(forKey: key)
+            resultCacheConversationIDs.removeValue(forKey: key)
+        }
+        latestResultCacheKeys = latestResultCacheKeys.filter { resultCache[$0.value] != nil }
+    }
+
     // MARK: - Result Cache
 
     private func cache(

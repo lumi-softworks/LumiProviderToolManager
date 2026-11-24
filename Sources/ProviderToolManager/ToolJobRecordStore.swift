@@ -363,6 +363,22 @@ public actor ToolJobRecordStore {
         try? modelContext.save()
     }
 
+    /// 删除指定回合的 Job 记录；同一会话的其它回合不受影响，会话仍可写入。
+    public func deleteJobs(forTurnIDs turnIDs: [UUID]) {
+        guard !turnIDs.isEmpty, let modelContext else { return }
+        let turnIDStrings = turnIDs.map(\.uuidString)
+        let descriptor = FetchDescriptor<ToolJobRecordModel>(
+            predicate: #Predicate<ToolJobRecordModel> { model in
+                model.turnID != nil && turnIDStrings.contains(model.turnID!)
+            }
+        )
+        guard let models = try? modelContext.fetch(descriptor) else { return }
+        for model in models {
+            modelContext.delete(model)
+        }
+        try? modelContext.save()
+    }
+
     /// 统一截断输出尾部，避免失控命令耗尽 Job 数据库。
     public static func boundedOutput(_ output: String) -> String {
         let data = Data(output.utf8)

@@ -93,6 +93,29 @@ struct ToolJobRecordStoreTests {
         #expect(await store.fetchRecord(forJobID: "job-c") != nil)
     }
 
+    @Test("Job Store 按回合删除，不影响同会话的其它回合")
+    func deleteJobsByTurn() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let conversationID = UUID()
+        let removedTurn = UUID()
+        let keptTurn = UUID()
+        await store.upsert(makeRecord(id: "job-removed", conversationID: conversationID, turnID: removedTurn))
+        await store.upsert(makeRecord(id: "job-kept", conversationID: conversationID, turnID: keptTurn))
+        await store.upsert(makeRecord(id: "job-no-turn", conversationID: conversationID, turnID: nil))
+
+        await store.deleteJobs(forTurnIDs: [removedTurn])
+
+        #expect(await store.fetchRecord(forJobID: "job-removed") == nil)
+        #expect(await store.fetchRecord(forJobID: "job-kept") != nil)
+        #expect(await store.fetchRecord(forJobID: "job-no-turn") != nil)
+
+        // 截断不等于删除会话：同一会话仍可写入新回合。
+        await store.upsert(makeRecord(id: "job-new", conversationID: conversationID, turnID: UUID()))
+        #expect(await store.fetchRecord(forJobID: "job-new") != nil)
+    }
+
     @Test("超过 Int32.max 的输出字节数在启动恢复后保持完整")
     func largeOutputByteCountSurvivesStartupRestore() async throws {
         let (store, directory) = try makeStore()

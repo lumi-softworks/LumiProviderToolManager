@@ -259,6 +259,24 @@ public actor ToolCallRecordStore {
         try? modelContext.save()
     }
 
+    /// 删除指定回合的记录；同一会话的其它回合不受影响，会话仍可写入。
+    public func deleteRecords(forTurnIDs turnIDs: [UUID]) {
+        guard !turnIDs.isEmpty, let modelContext else { return }
+        // 写后读屏障：先 flush，保证删除前已接受的记录不会在删除后才落库。
+        flush()
+        let turnIDStrings = turnIDs.map(\.uuidString)
+        let descriptor = FetchDescriptor<ToolCallRecordModel>(
+            predicate: #Predicate<ToolCallRecordModel> { model in
+                model.turnID != nil && turnIDStrings.contains(model.turnID!)
+            }
+        )
+        guard let models = try? modelContext.fetch(descriptor) else { return }
+        for model in models {
+            modelContext.delete(model)
+        }
+        try? modelContext.save()
+    }
+
     // MARK: - Flush
 
     /// 把缓冲区中的记录批量写入磁盘。
