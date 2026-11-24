@@ -52,6 +52,13 @@ public actor ToolJobRecordStore {
         modelContext?.autosaveEnabled = false
         self.modelContext = modelContext
         Self.ensureStartupLookupIndex(at: storeURL)
+        ToolRecordIndex.ensure(
+            name: "ZTOOLJOB_TURN",
+            table: "ZTOOLJOBRECORDMODEL",
+            // 带 ZCREATEDAT：按 turn 过滤后按时间排序也不需要临时排序。
+            columns: ["ZTURNID", "ZCREATEDAT"],
+            databaseURL: storeURL
+        )
     }
 
     /// 测试用：直接注入上下文；`nil` 表示存储不可用。

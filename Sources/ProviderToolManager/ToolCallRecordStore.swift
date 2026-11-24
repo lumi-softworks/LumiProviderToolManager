@@ -54,6 +54,13 @@ public actor ToolCallRecordStore {
         }
         modelContext?.autosaveEnabled = false
         self.modelContext = modelContext
+        ToolRecordIndex.ensure(
+            name: "ZTOOLCALL_TURN",
+            table: "ZTOOLCALLRECORDMODEL",
+            // 带 ZCREATEDAT：按 turn 过滤后按时间排序也不需要临时排序。
+            columns: ["ZTURNID", "ZCREATEDAT"],
+            databaseURL: storeURL
+        )
     }
 
     /// 测试用：直接注入上下文；`nil` 表示存储不可用。
